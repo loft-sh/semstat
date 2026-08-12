@@ -1,0 +1,131 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: semstat
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: semstat
+    main: .
+    binary: semstat
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # Stamp from the commit rather than the clock, so rebuilding a tag
+    # reproduces the same bytes.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: semstat
+    ids: [semstat]
+    formats: [tar.gz]
+    # The composite action in loft-sh/github-actions builds this filename from
+    # the version it pins. Renaming it breaks that download.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+    # goreleaser's default, pinned because the release verification asserts on
+    # these exact filenames and an upgrade could change them.
+    documents: ["${artifact}.sbom.json"]
+
+# Keyless, so there is no key to store or rotate. The signature covers
+# checksums.txt, which in turn covers every archive.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    artifacts: checksum
+
+dockers_v2:
+  - id: semstat
+    ids: [semstat]
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/loft-sh/semstat
+    # A prerelease repeats its own tag in both slots, because moving
+    # {major}.{minor} or latest onto it hands an rc to everyone pinned there.
+    tags:
+      - "{{ .Version }}"
+      - "{{ if .Prerelease }}{{ .Version }}{{ else }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if .Prerelease }}{{ .Version }}{{ else }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+
+# Signs the multi-arch index digest, which is what a consumer pulls. No --bundle:
+# legacy signing ignores it and writes nothing.
+docker_signs:
+  - cmd: cosign
+    args:
+      - "sign"
+      - "${artifact}@${digest}"
+      # Keeps the signature on a sha256-<digest>.sig tag. The new format pushes an
+      # untagged referrer and leaves discovery to a referrers API GHCR does not
+      # serve, which puts the signature somewhere nothing can read it.
+      - "--new-bundle-format=false"
+      # Required alongside it: the signing config refuses the old format.
+      - "--use-signing-config=false"
+      - "-a"
+      # Proves this run signed the image. Re-releasing a tag reproduces the digest,
+      # so an older run's signature would otherwise pass. `.Env.X` rather than
+      # `index`, because missingkey=error fails a typo instead of signing "-".
+      - "github-run={{ .Env.GITHUB_RUN_ID }}-{{ .Env.GITHUB_RUN_ATTEMPT }}"
+      - "--yes"
+
+homebrew_casks:
+  - name: semstat
+    ids: [semstat]
+    binaries: [semstat]
+    homepage: https://github.com/loft-sh/semstat
+    description: Reports facts about semantic versions
+    license: Apache-2.0
+    repository:
+      owner: loft-sh
+      name: homebrew-tap
+      # `index` rather than .Env.X so an unset variable is empty instead of a
+      # template error, which is what makes the skip below reachable.
+      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+    # A prerelease must not become what `brew install semstat` gets. Nor must a
+    # missing token: pushing with an empty one fails the whole step, after the
+    # images are in GHCR and before they are attested.
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
+    hooks:
+      post:
+        # The binary is cosign-signed but not notarized by Apple, so Gatekeeper
+        # would quarantine it on first run without this.
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/semstat"]
+          end
+
+release:
+  prerelease: auto
+  # Re-running a tag is the recovery path. Without these the second run fails on
+  # artifacts that already exist and keeps the stale notes.
+  replace_existing_artifacts: true
+  mode: replace
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

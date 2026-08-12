@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into a single PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group Go dependencies into a single PR",
+      "matchManagers": ["gomod"],
+      "groupName": "go"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update zizmor version pinned inline in CI workflow",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yaml$/"],
+      "matchStrings": ["pip install zizmor==(?<currentValue>[^\\s&]+)"],
+      "depNameTemplate": "zizmor",
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "customType": "regex",
+      "description": "Update tool versions annotated with `# renovate: datasource=X depName=Y` in workflows",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+[a-z-]*version: (?<currentValue>\\S+)"
+      ]
+    }
+  ]
+}

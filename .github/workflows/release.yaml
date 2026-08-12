@@ -1,0 +1,300 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to re-release. Select that same tag as the ref to run on."
+        required: true
+
+# Force-pushing a tag does not re-trigger a workflow, hence the dispatch input.
+# Cancelling would leave a release half published. Grouped on the bare tag name
+# so a dispatched re-release cannot race a push release of the same tag.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Known gap: signing runs at the end of goreleaser's publish phase, so a Fulcio,
+# Rekor or GHCR outage there leaves images and the release published with no
+# provenance. The run goes red, and a re-dispatch on the tag re-signs it.
+jobs:
+  release:
+    name: Build, publish and sign
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release, upload binaries
+      packages: write # push the image to GHCR
+      id-token: write # cosign keyless, provenance
+      attestations: write
+      artifact-metadata: write # storage record for the provenance attestation
+    outputs:
+      digest: ${{ steps.digest.outputs.value }}
+      tag: ${{ steps.tag.outputs.value }}
+      # verify has to compare against the attempt that signed. Re-running verify
+      # alone bumps the attempt while these outputs stay as they were.
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+    steps:
+      # The OIDC certificate and the provenance describe the ref the run started
+      # on, not what a later checkout selects, so dispatching from main with a tag
+      # input would build the tag and attest main.
+      - name: Refuse to run on anything but the tag being released
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REQUESTED: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "tag" ] || [ "$REF_NAME" != "$REQUESTED" ]; then
+            echo "::error::run this workflow with the tag ${REQUESTED} selected as the ref; it was run on ${REF_TYPE} ${REF_NAME}, and the provenance would describe that instead"
+            exit 1
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The workflow's own ref, so the build matches what the certificate and
+          # provenance claim. Full history because goreleaser builds the changelog
+          # from it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          # No build cache on a publishing workflow: a poisoned cache entry
+          # would end up inside a signed artifact.
+          cache: false
+
+      # No QEMU: the Dockerfile only copies a prebuilt binary, so nothing runs for
+      # the target platform. It would add a privileged image to the job holding
+      # the release credentials.
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          # Pinned so the binary that runs inside goreleaser, alongside the
+          # release credentials, cannot change under us between releases.
+          # renovate: datasource=github-releases depName=anchore/syft
+          syft-version: v1.51.0
+
+      - name: Resolve the tag being released
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "value=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          # Pinned exactly. A floating "~> v2" lets the binary that builds and
+          # signs a release differ from the one CI validated the config with.
+          # renovate: datasource=github-releases depName=goreleaser/goreleaser
+          version: v2.17.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pushing the cask to loft-sh/homebrew-tap is a cross-repo write, which
+          # GITHUB_TOKEN cannot do.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      # Read from what this run built rather than by inspecting the registry
+      # tag. A tag is mutable, so re-reading it could resolve to another run's
+      # image and attest that instead.
+      - name: Resolve the multi-arch manifest digest
+        id: digest
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/loft-sh/semstat:${TAG#v}"
+          digest="$(jq -er --arg image "$image" '
+            [.[] | select(.type == "Docker Image" and .name == $image) | .extra.Digest]
+            | unique
+            | if length == 1 then .[0]
+              else error("expected exactly one digest for \($image), got \(.)")
+              end
+          ' dist/artifacts.json)"
+          echo "value=${digest}" >> "$GITHUB_OUTPUT"
+
+      # The image itself is signed by goreleaser's docker_signs. This attaches
+      # the SLSA provenance to the same index digest.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/loft-sh/semstat
+          subject-digest: ${{ steps.digest.outputs.value }}
+          push-to-registry: true
+
+      # A re-release of a tag is byte-identical, so a previous run's signature
+      # would satisfy the verify job. This bundle exists only if signing ran here.
+      # Only the checksums are covered, because only their signature comes back as
+      # a file; the run annotation proves the same for the image.
+      #
+      # Last in the job, so a Rekor or Fulcio flake cannot abort a publish partway.
+      - name: Confirm signing ran in this run
+        run: |
+          set -euo pipefail
+
+          if [ ! -s dist/checksums.txt.sigstore.json ]; then
+            echo "::error::goreleaser produced no checksums signature; signing was skipped or removed"
+            exit 1
+          fi
+
+          cosign verify-blob dist/checksums.txt \
+            --bundle dist/checksums.txt.sigstore.json \
+            --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+
+  verify:
+    name: Verify the published release
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      # Explicit permissions make every unlisted scope none, and
+      # `gh attestation verify` reads the attestation through the API.
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ghcr.io/loft-sh/semstat@${{ needs.release.outputs.digest }}
+      TAG: ${{ needs.release.outputs.tag }}
+      RUN_ID: ${{ needs.release.outputs.run_id }}
+      RUN_ATTEMPT: ${{ needs.release.outputs.run_attempt }}
+      # The exact signing identity, tag included. A regexp ending in @.* would
+      # also accept a signature made by a run on another ref.
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yaml@refs/tags/${{ needs.release.outputs.tag }}
+    steps:
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # A GHCR package is private until somebody makes it public, and it does
+      # not inherit the repository's visibility. Without this the first release
+      # publishes fine and then fails verification on an anonymous pull.
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the image signature and provenance
+        run: |
+          set -euo pipefail
+
+          # An empty marker would make every check below read as "an earlier run
+          # signed this".
+          : "${RUN_ID:?the release job published no run id to compare against}"
+          : "${RUN_ATTEMPT:?the release job published no run attempt to compare against}"
+
+          # The annotation is what separates this run from an earlier run on the
+          # same tag, which produces the same digest and the same identity.
+          # --new-bundle-format=false because the signature is on a tag, and cosign
+          # reads that tag only when it finds no bundle. The attest step leaves one.
+          cosign verify "$REF" \
+            --new-bundle-format=false \
+            -a "github-run=${RUN_ID}-${RUN_ATTEMPT}" \
+            --certificate-identity="$IDENTITY" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+
+          # Bound to the signer and the tag: the repository alone would accept an
+          # attestation from any workflow here, or from a run on another ref.
+          # --limit is at the maximum because re-releases pile attestations onto
+          # the same digest, and this run's own has to be in the page fetched.
+          gh attestation verify "oci://${REF}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yaml" \
+            --source-ref "refs/tags/${TAG}" \
+            --limit 1000 \
+            --format json > attestations.json
+
+          # An attestation an earlier run left on this unchanged digest satisfies
+          # every check above, so check which run made it. Read the certificate,
+          # not the predicate: Fulcio sets runInvocationURI from the OIDC token, so
+          # the attested workflow cannot choose it. The predicate only has to agree.
+          jq -er --arg want "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}" '
+            [.[] | .verificationResult.signature.certificate.runInvocationURI] as $signers
+            | [.[] | select(.verificationResult.signature.certificate.runInvocationURI == $want)
+                   | (try .verificationResult.statement.predicate.runDetails.metadata.invocationId catch null) // null] as $claimed
+            | if ($signers | map(values) | length) == 0 then
+                error("gh reported no runInvocationURI at all; its output shape changed, so fix this check rather than drop it")
+              elif ($claimed | length) == 0 then
+                error("the provenance here was signed by \($signers), not \($want); an earlier run left it")
+              elif ($claimed | any(. == null)) then
+                error("the attestation signed by \($want) carries no predicate invocationId; the predicate shape changed, so fix this cross-check rather than drop it")
+              elif ($claimed | any(. != $want)) then
+                error("an attestation signed by \($want) claims \($claimed) in its predicate")
+              else true
+              end
+          ' attestations.json > /dev/null
+
+      - name: Run the image on each architecture
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform="$platform" "$REF" version
+            # The pinned digest binds to the first architecture pulled, so the
+            # second run fails unless it is dropped in between.
+            docker rmi "$REF" >/dev/null 2>&1 || true
+          done
+
+      - name: Verify the release artifacts are complete and intact
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          version="${TAG#v}"
+
+          # checksums.txt covers the SBOMs too, and 'semstat_*.tar.gz' does not
+          # match the .sbom.json names, so both patterns are needed.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'checksums.txt*' \
+            --pattern 'semstat_*.tar.gz' \
+            --pattern 'semstat_*.tar.gz.sbom.json'
+
+          # Compare against what the release carries, not what the globs fetched.
+          # An asset left by an older configuration matches no pattern here, so
+          # listing the downloads would never notice it.
+          expected="checksums.txt\nchecksums.txt.sigstore.json\n"
+          for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            expected="${expected}semstat_${version}_${target}.tar.gz\n"
+            expected="${expected}semstat_${version}_${target}.tar.gz.sbom.json\n"
+          done
+
+          published="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+
+          if ! diff <(printf "%b" "$expected" | sort) <(printf '%s\n' "$published" | sort); then
+            echo "::error::release ${TAG} does not carry exactly the expected assets"
+            exit 1
+          fi
+
+          cosign verify-blob checksums.txt \
+            --bundle checksums.txt.sigstore.json \
+            --certificate-identity="$IDENTITY" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+
+          # No --ignore-missing: everything checksums.txt covers was downloaded
+          # above, so anything absent now is a real gap.
+          sha256sum -c checksums.txt
+
+      - name: Run the released binary
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          version="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "semstat_${version}_linux_amd64.tar.gz"
+          tar -xzf "semstat_${version}_linux_amd64.tar.gz" semstat
+          test "$(./semstat type v2.0.0-rc.2)" = "rc"
+          test "$(./semstat compare v2.0.0-rc.2 v2.0.0)" = "-1"
