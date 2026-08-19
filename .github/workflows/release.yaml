@@ -106,6 +106,10 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # goreleaser otherwise reads the tag from `git describe`, which is
+          # ambiguous when a commit carries more than one: releasing v0.0.1 from a
+          # commit also tagged v0.0.1-alpha.2 built and pushed the alpha instead.
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.value }}
           # Pushing the cask to loft-sh/homebrew-tap is a cross-repo write, which
           # GITHUB_TOKEN cannot do.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
