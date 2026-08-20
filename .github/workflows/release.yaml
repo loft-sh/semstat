@@ -302,3 +302,33 @@ jobs:
           tar -xzf "semstat_${version}_linux_amd64.tar.gz" semstat
           test "$(./semstat type v2.0.0-rc.2)" = "rc"
           test "$(./semstat compare v2.0.0-rc.2 v2.0.0)" = "-1"
+
+          # The exit codes are the contract callers gate releases on, and this is
+          # the last point where a binary that got them wrong is caught. `code`
+          # runs the command in a condition so that set -e leaves the status to be
+          # read rather than ending the step on the first non-zero, and `expect`
+          # names the call that disagreed, which a bare `test` would not.
+          code() { local s=0; "$@" >/dev/null 2>&1 || s=$?; echo "$s"; }
+          expect() {
+            local want=$1 got
+            shift
+            got="$(code "$@")"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$* exited $got, want $want"
+              return 1
+            fi
+          }
+
+          expect 0 ./semstat validate v1.2.3
+          expect 1 ./semstat validate 1.2
+          expect 0 ./semstat gt v2.0.0 v1.9.9
+          expect 1 ./semstat gt v1.9.9 v2.0.0
+          # An unreadable version and a misused command must not share a code:
+          # a caller that reads 2 as "not a version" would otherwise take a
+          # renamed subcommand, or its own flag left where a tag should have
+          # been, for a verdict on its tag.
+          expect 2 ./semstat parse 1.2
+          expect 2 ./semstat type v1.2.3-preview.1
+          expect 64 ./semstat parse
+          expect 64 ./semstat frobnicate v1.2.3
+          expect 64 ./semstat type --json

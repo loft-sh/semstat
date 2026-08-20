@@ -50,15 +50,17 @@ never affects it and a prerelease always sorts below its final release.
 
 | Command | Prints | Exit codes |
 | -- | -- | -- |
-| `validate <version>` | nothing, reason on stderr when invalid | 0 valid, 1 invalid |
-| `parse <version>` | one line of JSON | 0, 2 unreadable |
-| `type <version>` | one word | 0, 2 unreadable or unroutable |
-| `compare <a> <b>` | `-1`, `0` or `1` | 0, 2 unreadable |
-| `gt <a> <b>` | nothing | 0 above, 1 not above, 2 unreadable |
-| `version` | semstat's own version | 0 |
-| `help` | the usage text | 0 |
+| `validate <version>` | nothing, reason on stderr when invalid | 0 valid, 1 invalid, 64 misuse |
+| `parse <version>` | one line of JSON | 0, 2 unreadable, 64 misuse |
+| `type <version>` | one word | 0, 2 unreadable or unroutable, 64 misuse |
+| `compare <a> <b>` | `-1`, `0` or `1` | 0, 2 unreadable, 64 misuse |
+| `gt <a> <b>` | nothing | 0 above, 1 not above, 2 unreadable, 64 misuse |
+| `version` | semstat's own version | 0, 64 misuse |
+| `help` | the usage text | 0, 64 misuse |
 
-Misuse is always 2: an unknown command, or the wrong number of arguments.
+Misuse is always 64, on every command: an unknown command, the wrong number of
+arguments, or an option where a version was expected. It never overlaps with 2, so accepting 2 as a fact about the version
+never also accepts "that subcommand is not in this binary".
 
 ### validate
 
@@ -164,26 +166,57 @@ $ semstat version
 
 The version is stamped at release time, so a binary built from source reports
 `dev`. `help`, `-h` and `--help` print the usage to stdout. Running `semstat` with no
-command at all prints the same text to stderr and exits 2, so a bare invocation
+command at all prints the same text to stderr and exits 64, so a bare invocation
 in a pipeline fails instead of feeding usage text downstream.
 
 ### Exit codes
 
-Three codes, not two:
+Four codes, not two:
 
 - **0** the command succeeded, or the answer is yes
 - **1** the answer is no
-- **2** the input could not be understood, or the command was misused
+- **2** the input could not be understood
+- **64** the command was misused
 
 Only `validate` and `gt` have an answer that means no. Every other command
 reports an unreadable version as 2. The split matters, because the alternative
 is the bug this tool was built to remove: without a distinct code, a typo in
 `$candidate` is indistinguishable from a legitimate "not newer".
 
-Reading exit 2 takes a little care, because the shell hides it in exactly the
-places you would want it. `set -e` does not apply to a condition, so `if` and
-`&&` swallow every non-zero status alike, and `$(...)` discards the status of
-the command inside it. So branch on the code rather than on the command:
+64 continues that split one step out. A caller may reasonably treat 2 from
+`parse` or `type` as "not a version we can use" and carry on, and that is only
+safe while 2 cannot also mean "this binary does not have that subcommand". So an
+unknown command, a wrong argument count and a bad flag are 64, on every command
+including `version` and `help`. A caller that accepts 2 as an answer should treat
+64 as a hard failure: it is never a fact about the version, only about the call.
+
+```bash
+status=0
+parsed="$(semstat parse "$tag")" || status=$?
+case $status in
+  0) ;;                                  # readable, use $parsed
+  2) echo "$tag is not a version" ;;     # an answer, carry on
+  *) echo "semstat is being called wrong" >&2
+     exit 1 ;;
+esac
+```
+
+Capture the status through `|| status=$?` rather than reading `$?` on the next
+line, so the branch survives `set -e`, which would otherwise take the failing
+assignment as the end of the script.
+
+The numbers are borrowed rather than invented. 0, 1 and 2 are the contract `grep`
+and `diff` use for yes, no and trouble. 64 is `EX_USAGE` from `sysexits.h`,
+because that family has no number of its own for "you called me wrong" and
+overloads 2 with it, which is the bug this split exists to remove. The gap is
+deliberate: 0, 1 and 2 are all conclusions about a version, and 64 is visibly not
+one.
+
+Reading a non-zero exit takes a little care, because the shell hides it in
+exactly the places you would want it. `set -e` does not apply to a condition, so
+`if` and `&&` swallow every non-zero status alike, and `$(...)` discards the
+status of the command inside it. So branch on the code rather than on the
+command:
 
 ```bash
 if semstat gt "$candidate" "$current"; then
@@ -191,7 +224,7 @@ if semstat gt "$candidate" "$current"; then
 elif [ $? -eq 1 ]; then
   echo "not newer"
 else
-  exit 1          # 2: one of them was not a version
+  exit 1          # 2 or 64: not an ordering answer at all
 fi
 ```
 
@@ -264,13 +297,27 @@ ever sees two real versions and its answer is yes or no rather than three-way.
 ```bash
 newest=""
 while read -r tag; do
-  semstat validate "$tag" 2>/dev/null || { echo "skipping $tag" >&2; continue; }
+  status=0
+  semstat validate "$tag" 2>/dev/null || status=$?
+  case $status in
+    0) ;;                                          # a version, consider it
+    1) echo "skipping $tag" >&2; continue ;;       # not a version
+    *) echo "cannot read the tag list" >&2         # 64: we are calling it wrong
+       exit 1 ;;
+  esac
+
   if [ -z "$newest" ] || semstat gt "$tag" "$newest"; then
     newest="$tag"
   fi
 done < <(git tag -l 'v*')
 echo "$newest"
 ```
+
+Branch on `validate`'s code rather than using it as a bare condition. 1 means
+"not a version, skip it", but 64 means we are calling semstat wrong, and skipping
+on that would work through every tag and print the newest of nothing. Once
+`validate` has passed, `gt` is comparing two real versions, so its answer there
+really is only yes or no.
 
 Read from a process substitution, not `git tag -l | while`: a pipeline runs the
 loop in a subshell, and `$newest` is empty again by the time the loop ends.

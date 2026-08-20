@@ -131,7 +131,8 @@ func TestParseEmitsNullNotEmptyString(t *testing.T) {
 
 func TestParseRejectsInvalid(t *testing.T) {
 	// parse has no answer that means "not a version", so an unreadable input is
-	// ExitError rather than ExitNo.
+	// ExitError rather than ExitNo, and not ExitUsage either: see
+	// TestMisuseIsDistinctFromUnreadableInput.
 	code, stdout, stderr := run(t, "parse", "1.2")
 
 	if code != ExitError {
@@ -319,14 +320,49 @@ func TestArgumentCounts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			code, stdout, stderr := run(t, tt.args...)
 
-			if code != ExitError {
-				t.Errorf("exit = %d, want %d", code, ExitError)
+			if code != ExitUsage {
+				t.Errorf("exit = %d, want %d", code, ExitUsage)
 			}
 			if stdout != "" {
 				t.Errorf("stdout = %q, want empty", stdout)
 			}
 			if !strings.Contains(stderr, "takes ") {
 				t.Errorf("stderr = %q, want it to state the expected argument count", stderr)
+			}
+		})
+	}
+}
+
+// TestOptionsInVersionPositions covers the common shape of the miscall: an
+// unquoted "$tag" that expanded to nothing, leaving semstat one argument that is
+// the caller's own flag. No valid version starts with a dash, so the only useful
+// answer is that the call was wrong, not that the version was unreadable.
+func TestOptionsInVersionPositions(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"validate", []string{"validate", "--strict"}},
+		{"parse", []string{"parse", "-h"}},
+		{"type", []string{"type", "--json"}},
+		{"compare first", []string{"compare", "-v", "1.2.3"}},
+		{"compare second", []string{"compare", "1.2.3", "-v"}},
+		{"gt first", []string{"gt", "--quiet", "1.2.3"}},
+		{"gt second", []string{"gt", "1.2.3", "--quiet"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := run(t, tt.args...)
+
+			if code != ExitUsage {
+				t.Errorf("exit = %d, want %d (stderr: %s)", code, ExitUsage, stderr)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, "option") {
+				t.Errorf("stderr = %q, want it to name the offending option", stderr)
 			}
 		})
 	}
@@ -372,8 +408,8 @@ func TestVersion(t *testing.T) {
 func TestNoArguments(t *testing.T) {
 	code, stdout, stderr := run(t)
 
-	if code != ExitError {
-		t.Errorf("exit = %d, want %d", code, ExitError)
+	if code != ExitUsage {
+		t.Errorf("exit = %d, want %d", code, ExitUsage)
 	}
 	// Unasked-for help goes to stderr, so a bare `semstat` in a pipeline does
 	// not feed the usage text downstream.
@@ -385,11 +421,72 @@ func TestNoArguments(t *testing.T) {
 	}
 }
 
+// TestMisuseIsDistinctFromUnreadableInput pins the split callers depend on.
+// A caller that accepts ExitError from parse or type as "not a version" and
+// stays green has to be sure that code cannot also mean "I do not have that
+// subcommand": otherwise a bad pin turns a valid tag into a false verdict on a
+// green step.
+func TestMisuseIsDistinctFromUnreadableInput(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"parse reads an invalid version", []string{"parse", "1.2"}, ExitError},
+		{"parse with no version", []string{"parse"}, ExitUsage},
+		{"parse with two versions", []string{"parse", "1.2.3", "1.2.4"}, ExitUsage},
+		{"parse renamed away", []string{"parse-version", "1.2.3"}, ExitUsage},
+		{"parse given an option", []string{"parse", "-h"}, ExitUsage},
+
+		{"type reads an invalid version", []string{"type", "1.2"}, ExitError},
+		{"type reads an unroutable suffix", []string{"type", "1.2.3-preview.1"}, ExitError},
+		{"type with no version", []string{"type"}, ExitUsage},
+		{"type with two versions", []string{"type", "1.2.3", "1.2.4"}, ExitUsage},
+		{"type renamed away", []string{"release-type", "1.2.3"}, ExitUsage},
+		{"type given an option", []string{"type", "--json"}, ExitUsage},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := run(t, tt.args...)
+
+			if code != tt.want {
+				t.Errorf("exit = %d, want %d (stderr: %s)", code, tt.want, stderr)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty", stdout)
+			}
+			if stderr == "" {
+				t.Error("stderr is empty, want an explanation")
+			}
+		})
+	}
+}
+
+// The codes are a published contract, so their values are asserted rather than
+// left to whatever order the constants happen to be declared in.
+func TestExitCodeValues(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"ExitOK", ExitOK, 0},
+		{"ExitNo", ExitNo, 1},
+		{"ExitError", ExitError, 2},
+		{"ExitUsage", ExitUsage, 64},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("%s = %d, want %d", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
 func TestUnknownCommand(t *testing.T) {
 	code, stdout, stderr := run(t, "frobnicate", "1.2.3")
 
-	if code != ExitError {
-		t.Errorf("exit = %d, want %d", code, ExitError)
+	if code != ExitUsage {
+		t.Errorf("exit = %d, want %d", code, ExitUsage)
 	}
 	if stdout != "" {
 		t.Errorf("stdout = %q, want empty", stdout)
