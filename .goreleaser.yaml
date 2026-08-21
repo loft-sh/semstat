@@ -116,10 +116,24 @@ homebrew_casks:
 
 release:
   prerelease: auto
-  # Re-running a tag is the recovery path. Without these the second run fails on
-  # artifacts that already exist and keeps the stale notes.
+  # Pinned rather than left to its default, because goreleaser matches the draft
+  # it deletes on release name alone, and release.yaml resolves the draft it
+  # publishes on name as well as tag. Retitling releases would break both.
+  name_template: "{{ .Tag }}"
+  # Immutability engages when a release is published, so a release that goes out
+  # before its signatures can never gain them. release.yaml flips this off as its
+  # last step, once signing and attestation have both succeeded, which leaves a
+  # failed run with a deletable draft instead of a frozen half-release.
+  draft: true
+  # Re-dispatching a tag is the recovery path. goreleaser looks an existing
+  # release up by tag through an endpoint that returns published ones only, so
+  # without this it never sees the draft its own failed run left behind and
+  # creates a second one for the same tag.
+  replace_existing_draft: true
+  # A separate failure, inside a single run: an upload that lands on GitHub but
+  # reports a network error comes back 422 on retry, and goreleaser gives up on
+  # it unless it is allowed to delete the half-uploaded asset and try again.
   replace_existing_artifacts: true
-  mode: replace
 
 changelog:
   use: github
