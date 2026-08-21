@@ -413,7 +413,8 @@ the closest-looking branch.
 ## Verifying a download
 
 Releases are built by GitHub Actions, signed keyless with cosign, and carry SLSA
-build provenance.
+build provenance. A published release is immutable, so its assets are the ones
+its signature was made over, for as long as the release exists.
 
 Give the identity exactly, tag included. A regexp ending in `@.*` would also
 accept a signature made by a run on some other ref, which is most of what the
@@ -485,9 +486,26 @@ Push a tag; the pipeline does the rest.
 git tag -s v1.2.3 && git push origin v1.2.3
 ```
 
+The pipeline creates the release as a draft and publishes it as its last step,
+once the archives, the checksum signature and the image provenance are all in
+place. Releases in this repository are immutable, and immutability engages when a
+release is published, so publishing last is what keeps a release from being
+frozen before its provenance exists. The images are not covered by that. They are
+pushed during goreleaser's publish phase, and `latest` and the floating
+`{major}.{minor}` tag move onto them there, before the attestation step, so a run
+that dies in between leaves those tags on an image with no provenance until the
+next release moves them.
+
 Re-running an existing tag is a `workflow_dispatch` on `release.yaml`, because
-force-pushing a tag does not re-trigger a workflow. Re-runs replace the release
-artifacts and notes rather than appending to them.
+force-pushing a tag does not re-trigger a workflow. It repairs a release that is
+still a draft: the draft is deleted and cut again from scratch, so nothing from
+the failed run carries over and there is nothing to clean up by hand. A run whose
+release is already published refuses to start, since nothing can replace the
+assets or notes of an immutable release, so a bad one is superseded by a new tag
+rather than repaired. It also refuses a tag carrying a draft it cannot cleanly
+replace, such as one the GitHub UI left untitled or a second draft on the same
+tag, because goreleaser replaces at most one draft and only one named after the
+tag.
 
 A prerelease tag moves neither `latest` nor the floating `{major}.{minor}` image
 tag, and is marked as a prerelease on GitHub. Releases are otherwise assumed to
@@ -499,3 +517,8 @@ The Homebrew cask is pushed to `loft-sh/homebrew-tap` with `HOMEBREW_TAP_TOKEN`,
 which must be a `loft-bot` token: pushing to that repo's default branch needs
 approval, per the GitHub Actions Developer Guide. If the secret is absent the
 cask upload is skipped and the rest of the release still publishes.
+
+The cask is pushed during goreleaser's publish phase, while the release is still
+a draft, so the URL it points at answers 404 until the publish step runs a minute
+later. A run that dies in between leaves the tap pointing at an unpublished
+release until the next release replaces the cask.

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to re-release. Select that same tag as the ref to run on."
+        description: "Existing tag to re-release, while its release is still a draft. Select that same tag as the ref to run on."
         required: true
 
 # Force-pushing a tag does not re-trigger a workflow, hence the dispatch input.
@@ -19,9 +19,14 @@ concurrency:
 permissions:
   contents: read
 
-# Known gap: signing runs at the end of goreleaser's publish phase, so a Fulcio,
-# Rekor or GHCR outage there leaves images and the release published with no
-# provenance. The run goes red, and a re-dispatch on the tag re-signs it.
+# Signing runs at the end of goreleaser's publish phase, so a Fulcio, Rekor or
+# GHCR outage there leaves the release built but unsigned. goreleaser keeps it a
+# draft and the last step here publishes it, so an outage leaves no visible
+# release and nothing immutable: re-dispatch the tag and the draft is cut again
+# from scratch. The images are in GHCR by then and the floating tags have already
+# moved onto them, so what a re-dispatch repairs is the release, not those. Once
+# the release is published it is frozen, and a re-dispatch repairs nothing, which
+# is why the run refuses to start against one.
 jobs:
   release:
     name: Build, publish and sign
@@ -53,6 +58,52 @@ jobs:
           set -euo pipefail
           if [ "$REF_TYPE" != "tag" ] || [ "$REF_NAME" != "$REQUESTED" ]; then
             echo "::error::run this workflow with the tag ${REQUESTED} selected as the ref; it was run on ${REF_TYPE} ${REF_NAME}, and the provenance would describe that instead"
+            exit 1
+          fi
+
+      # goreleaser reaches an existing release only in its publish phase, by which
+      # point the images are already in GHCR and the mutable tags have moved onto
+      # them. So both ways that ends badly are caught here, before anything is
+      # built: a published release the run cannot replace, and a draft goreleaser
+      # cannot clear on its own. A single draft named after the tag is fine, and
+      # is the thing a re-dispatch is here to repair.
+      - name: Refuse to release over a release this run cannot replace
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # `jq -s add` because whether --paginate emits one merged array or one
+          # array per page is gh's business, not something either check below
+          # should be able to get wrong: both shapes normalise to a flat list.
+          releases="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -s 'add // []')"
+
+          published="$(jq -r --arg tag "$TAG" \
+            '.[] | select(.tag_name == $tag and .draft == false) | .html_url' <<<"$releases")"
+          if [ -n "$published" ]; then
+            echo "::error::${TAG} is already published as ${published}; that release is immutable, so this run cannot replace its assets or notes. Cut a new tag instead."
+            exit 1
+          fi
+
+          # replace_existing_draft finds the draft to delete by release name, not
+          # by tag, and deletes only the first it finds. So a draft the GitHub UI
+          # left untitled, a second draft on the tag, or a draft carrying this
+          # tag's name against a different tag all survive the build, and leave
+          # the publish step below without one unambiguous draft to publish, by
+          # which point the images have been pushed and signed for nothing.
+          blocking="$(jq -r --arg tag "$TAG" '
+            [.[] | select(.draft and (.name == $tag or .tag_name == $tag))] as $drafts
+            | if ($drafts | length) == 0
+                or ($drafts | length) == 1
+                   and $drafts[0].name == $tag
+                   and $drafts[0].tag_name == $tag
+              then ""
+              else $drafts | map({name, tag_name}) | tojson
+              end' <<<"$releases")"
+          if [ -n "$blocking" ]; then
+            echo "::error::${TAG} already has draft release(s) goreleaser cannot cleanly replace: ${blocking}. It replaces at most one draft, and only one whose name and tag are both ${TAG}. Delete them and re-dispatch the tag."
             exit 1
           fi
 
@@ -161,6 +212,35 @@ jobs:
             --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}" \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com
 
+      # Everything above is repairable because none of it is visible yet. This is
+      # the line: publishing makes the release immutable, so it runs only once the
+      # assets, the signature and the provenance are all in place. The verify job
+      # then checks the release consumers can actually see.
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -euo pipefail
+
+          # `gh release edit <tag>` resolves the tag by racing a published lookup
+          # against a draft one and taking whichever answers first, so with more
+          # than one draft on the tag it can publish an older, unsigned draft and
+          # leave this run's behind. Publishing an id cannot pick the wrong one.
+          # Matched on name as well as tag, because that is the pair goreleaser
+          # creates its draft with and the preflight has already rejected any
+          # other draft on the tag.
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -s -r --arg tag "$TAG" \
+              'add // [] | .[] | select(.draft and .tag_name == $tag and .name == $tag) | .id')"
+          count="$(printf '%s' "$ids" | grep -c . || true)"
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly one draft release for ${TAG}, found ${count}; delete the drafts and re-dispatch the tag rather than publishing a guess"
+            exit 1
+          fi
+
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${ids}" -F draft=false --silent
+
   verify:
     name: Verify the published release
     needs: release
@@ -181,6 +261,20 @@ jobs:
       # also accept a signature made by a run on another ref.
       IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yaml@refs/tags/${{ needs.release.outputs.tag }}
     steps:
+      # `GET /repos/{owner}/{repo}/immutable-releases` reports the setting
+      # directly, but it wants admin read, and no GITHUB_TOKEN permission grants
+      # that. A published release is therefore the only place an Actions run can
+      # see the setting, so this is also the check that notices it being turned
+      # off: without it every asset below can still be replaced after the fact.
+      - name: Confirm the release is immutable
+        run: |
+          set -euo pipefail
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.immutable')"
+          if [ "$immutable" != "true" ]; then
+            echo "::error::release ${TAG} reports immutable=${immutable}; re-enable release immutability for ${GITHUB_REPOSITORY}, because until it is on these assets can be replaced without moving the tag"
+            exit 1
+          fi
+
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
