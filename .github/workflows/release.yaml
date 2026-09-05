@@ -140,7 +140,7 @@ jobs:
           # Pinned so the binary that runs inside goreleaser, alongside the
           # release credentials, cannot change under us between releases.
           # renovate: datasource=github-releases depName=anchore/syft
-          syft-version: v1.51.0
+          syft-version: v1.51.1
 
       - name: Resolve the tag being released
         id: tag
