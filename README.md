@@ -116,7 +116,7 @@ next-internal
 
 A suffix outside that vocabulary is an error, not a sixth answer. This is the
 one command that rejects versions `validate` accepts, and the counter is part of
-the shape, so `-rc` and `-rc2` fail where `-rc.2` succeeds.
+the shape, so `-rc`, `-rc2` and `-rc.final` fail where `-rc.2` succeeds.
 
 ```console
 $ semstat type v1.2.3-preview.1
@@ -393,7 +393,9 @@ deliberately narrow:
 | `-next.internal.N` | `next-internal` |
 
 The counter is part of the shape, not decoration. `-rc.2` is an `rc`; a bare
-`-rc` is an error, and so is the undotted `-rc2`. `-next.internal` is an error
+`-rc` is an error, and so is the undotted `-rc2`. The counter is a number, since
+it is what orders one prerelease after the last, so `-rc.final` and
+`-alpha.abc123` are errors too. `-next.internal` is an error
 too, because it is far more often `-next.internal.N` with the counter left off
 than it is a `next` counted by the word "internal", and guessing either way
 silently is worse than stopping.

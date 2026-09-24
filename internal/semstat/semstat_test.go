@@ -176,10 +176,8 @@ func TestType(t *testing.T) {
 		{"next internal", "v2.0.0-next.internal.3", NextInternal},
 		{"next internal wins over next", "v2.0.0-next.internal.1", NextInternal},
 		{"rc with build metadata", "v2.0.0-rc.2+abc123", RC},
-		// The counter does not have to be numeric to route. The vocabulary is
-		// about the flavor, and a non-numeric counter is a shape real tag
-		// histories contain.
-		{"non-numeric alpha counter", "v1.2.3-alpha.abc123", Alpha},
+		{"multi-digit counter", "v1.2.3-rc.10", RC},
+		{"zero counter", "v1.2.3-beta.0", Beta},
 	}
 
 	for _, tt := range tests {
@@ -239,6 +237,15 @@ func TestTypeFailsClosed(t *testing.T) {
 		// Only the whole identifier "internal" selects the sub-flavor, so this
 		// is next with two identifiers after it, which is not a defined shape.
 		{"counter resembling the sub-flavor", "v1.2.3-next.internalX.1"},
+
+		// The counter is a number. A word in its place is a tag cut to a shape
+		// nobody defined, and routing it would let a release pipeline cut an
+		// rc it cannot order against the next one.
+		{"non-numeric counter", "v1.2.3-alpha.abc123"},
+		{"word counter", "v1.2.3-rc.final"},
+		{"ticket-named counter", "v0.0.0-alpha.eng-3771"},
+		{"non-numeric sub-flavor counter", "v1.2.3-next.internal.x"},
+		{"non-numeric next counter", "v1.2.3-next.x"},
 	}
 
 	for _, tt := range tests {
