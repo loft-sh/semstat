@@ -140,7 +140,8 @@ func (v *Version) Parsed() Parsed {
 // legal semver but outside the vocabulary is an error, not a guess.
 //
 // Matching is on whole dot-separated identifiers, not prefixes, which is what
-// makes the counter mandatory. A prefix match would read the "internal" in a bare
+// makes the counter mandatory. The counter must be numeric too: it is what
+// orders one prerelease after the last, and a word there cannot be ordered. A prefix match would read the "internal" in a bare
 // "next.internal" as next's counter, when it is far more likely next-internal with
 // the counter left off.
 func (v *Version) Type() (ReleaseType, error) {
@@ -161,12 +162,12 @@ func (v *Version) Type() (ReleaseType, error) {
 	// matched before it.
 	switch {
 	case ids[0] == "next" && len(ids) > 1 && ids[1] == "internal":
-		if len(ids) != 3 {
+		if len(ids) != 3 || !isNumeric(ids[2]) {
 			return "", unsupported
 		}
 		return NextInternal, nil
 	case ids[0] == "next", ids[0] == "alpha", ids[0] == "beta", ids[0] == "rc":
-		if len(ids) != 2 {
+		if len(ids) != 2 || !isNumeric(ids[1]) {
 			return "", unsupported
 		}
 		return ReleaseType(ids[0]), nil
