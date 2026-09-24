@@ -48,7 +48,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: loft-sh/github-actions/.github/actions/govulncheck@035ae723b4ec9ad3a3ae8b13f12c26c75be5ea5e # govulncheck/v1
+      - uses: loft-sh/github-actions/.github/actions/govulncheck@c6a76f19cc302d63d1631853496bce5bf76a4e0a # govulncheck/v1
         with:
           # Slack notification is for scheduled scans in product repos, not PR runs here.
           notify: "false"
@@ -129,4 +129,4 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: loft-sh/github-actions/.github/workflows/validate-renovate.yaml@c40c1db6d6d24f1b75f6db794efe3a1bbf7cfb1a # validate-renovate/v1
+    uses: loft-sh/github-actions/.github/workflows/validate-renovate.yaml@c6a76f19cc302d63d1631853496bce5bf76a4e0a # validate-renovate/v1
