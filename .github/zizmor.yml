@@ -1,6 +1,0 @@
-rules:
-  unpinned-uses:
-    config:
-      policies:
-        "loft-sh/*": ref-pin
-        "*": hash-pin
