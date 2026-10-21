@@ -48,7 +48,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: loft-sh/github-actions/.github/actions/govulncheck@035ae723b4ec9ad3a3ae8b13f12c26c75be5ea5e # govulncheck/v1
+      - uses: loft-sh/github-actions/.github/actions/govulncheck@6d56ddbb6caa830e7c5b03f9929702bf25bcef30 # govulncheck/v1
         with:
           # Slack notification is for scheduled scans in product repos, not PR runs here.
           notify: "false"
